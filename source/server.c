@@ -86,6 +86,12 @@ int main () {
     exit(EXIT_FAILURE);
   }
 
+  // Установка опций и параметров сокету сервера для переиспользования адреса (не ждёт освобождения порта после предедущего закрытия)
+  int optval = 1;
+  if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+    perror("Ошибка установки параметров сокета");
+  }
+
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = INADDR_ANY;
   server_addr.sin_port = htons(PORT);
@@ -125,6 +131,16 @@ int main () {
       snprintf(file_path, sizeof(file_path), "%s/index.html", WEB_DIR);
     } else {
       snprintf(file_path, sizeof(file_path), "%s%s", WEB_DIR, path);
+    }
+
+    if (strstr(file_path, "..") != NULL) {
+      char* forbidden = 
+        "HTTP/1.1 403 Forbidden\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 15"
+        "403 - Forbidden";
+      send(client_fd, forbidden, strlen(forbidden), 0);
+      exit(EXIT_FAILURE);
     }
 
     send_file(client_fd, file_path);
