@@ -1,3 +1,4 @@
+#include <asm-generic/socket.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h> 
@@ -6,23 +7,26 @@
 #include <sys/socket.h> 
 #include <netinet/in.h> 
 #include <arpa/inet.h> 
+#include <errno.h>
+#include <sys/time.h>
 
 #define PORT 8080 
 #define BACKLOG 10 
 
 #define WEB_DIR "www"
 
-void send_file(int client_fd, const char* filepath) {
+void send_file(int client_fd, const char* filepath, const int is_keep_alive) {
   
   FILE* file = fopen(filepath, "rb");
   if (!file) {
-    char* error = 
+    char error404[512]; 
+    int error404_len = snprintf(error404, sizeof(error404), 
       "HTTP/1.1 404 Not Found\r\n"
       "Content-Type: text/html\r\n"
-      "Content-Length: 20"
+      "Content-Length: 20\r\n"
       "\r\n"
-      "404 - File Not Found";
-    send(client_fd, error, strlen(error), 0);
+      "404 - File Not Found");
+    send(client_fd, error404, error404_len, 0);
     return;
   }
 
@@ -52,12 +56,24 @@ void send_file(int client_fd, const char* filepath) {
   }
 
   char headers[512];
-  int header_length = snprintf(headers, sizeof(headers), 
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: %s\r\n"
-    "Content-Length: %ld\r\n"
-    "\r\n"
-  , mime_type, file_len);
+  int header_length = 0;
+  if (!is_keep_alive) {
+    header_length = snprintf(headers, sizeof(headers), 
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: %s\r\n"
+      "Connection: close\r\n"
+      "Content-Length: %ld\r\n"
+      "\r\n"
+      ,mime_type, file_len);
+  } else {
+    header_length = snprintf(headers, sizeof(headers), 
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: %s\r\n"
+      "Connection: keep-alive\r\n"
+      "Content-Length: %ld\r\n"
+      "\r\n"
+      ,mime_type, file_len);
+  }
   send(client_fd, headers, header_length, 0);
 
   char buffer[4096];
@@ -67,7 +83,7 @@ void send_file(int client_fd, const char* filepath) {
   }
 
   fclose(file);
-  printf("Файл отправлен");
+  printf("Файл отправлен\n");
 }
 
 int main () {
@@ -118,34 +134,68 @@ int main () {
     }
   
     printf("Подключился клиент: %s\n", inet_ntoa(client_addr.sin_addr)); 
+
+    struct timeval timer;
+    timer.tv_sec = 5;
+    timer.tv_usec = 0;
+
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timer, sizeof(timer));
+
+    while(1) {
+      char buffer[1024] = {0};
+      int res_recv = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+      printf("Запрос:\n%s\n", buffer);
+
+      if (res_recv < 0) {
+        printf("Таймаут, прошло время ожидания\n");
+        printf("Код ошибки: %d", errno);
+        break;
+      } else if(res_recv == 0) {
+        printf("Сокет был закрыт удалённой стороной\n");
+        break;
+      }
+  
+      char method[16], path[256], protocol[16];
+      int is_keep_alive = 0;
+      sscanf(buffer, "%s %s %s", method, path, protocol);
     
-    char buffer[1024] = {0};
-    read(client_fd, buffer, sizeof(buffer) - 1);
-    printf("Запрос:\n%s\n", buffer);
-
-    char method[16], path[256], protocol[16];
-    sscanf(buffer, "%s %s %s", method, path, protocol);
-    
-    char file_path[512];
-    if (strcmp(path, "/") == 0) {
-      snprintf(file_path, sizeof(file_path), "%s/index.html", WEB_DIR);
-    } else {
-      snprintf(file_path, sizeof(file_path), "%s%s", WEB_DIR, path);
+      char file_path[512];
+      if (strcmp(path, "/") == 0) {
+        snprintf(file_path, sizeof(file_path), "%s/index.html", WEB_DIR);
+      } else {
+        snprintf(file_path, sizeof(file_path), "%s%s", WEB_DIR, path);
+      }
+      
+      // Защита против Path Traversal
+      if (strstr(file_path, "..") != NULL) {
+        char* forbidden = 
+          "HTTP/1.1 403 Forbidden\r\n"
+          "Content-Type: text/html\r\n"
+          "Content-Length: 15\r\n"
+          "\r\n"
+          "403 - Forbidden";
+        send(client_fd, forbidden, strlen(forbidden), 0);
+        break;
+      }
+  
+      if (strstr(buffer, "Connection: keep-alive") != NULL) {
+        is_keep_alive = 1;
+      } else if (strstr(buffer, "HTTP/1.1") != NULL && strstr(buffer, "Connection: close") == NULL) {
+        is_keep_alive = 1;
+      } else {
+        is_keep_alive = 0;
+      }
+  
+      send_file(client_fd, file_path, is_keep_alive);
+       
+      if (!is_keep_alive) {
+        printf("Соединение разорвано, Connection: close\n");
+        break;
+      }
+  
     }
-
-    if (strstr(file_path, "..") != NULL) {
-      char* forbidden = 
-        "HTTP/1.1 403 Forbidden\r\n"
-        "Content-Type: text/html\r\n"
-        "Content-Length: 15"
-        "403 - Forbidden";
-      send(client_fd, forbidden, strlen(forbidden), 0);
-      exit(EXIT_FAILURE);
-    }
-
-    send_file(client_fd, file_path);
-
     close(client_fd);
+    
   }
 
   close(server_fd);
